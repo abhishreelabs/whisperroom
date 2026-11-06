@@ -38,6 +38,7 @@ export interface ChatMessage {
   timestamp: number;
   reactions?: Record<string, Reaction>;
   burnSeconds?: number;
+  viewedBy?: string[]; // IDs of users who opened/viewed
 }
 
 export interface RoomState {
@@ -70,7 +71,7 @@ app.prepare().then(() => {
       origin: "*",
       methods: ["GET", "POST"],
     },
-    maxHttpBufferSize: 1e7, // 10MB buffer for fast image/file transfer
+    maxHttpBufferSize: 1e7, // 10MB buffer for fast direct memory image transfer
   });
 
   io.on("connection", (socket) => {
@@ -210,6 +211,11 @@ app.prepare().then(() => {
       if (!room || !room.participants.has(socket.id)) return;
 
       const sender = room.participants.get(socket.id);
+      
+      // Images default to 10-second self-destruct once viewed
+      const isImage = type === "image";
+      const finalBurn = burnSeconds || (isImage ? 10 : type === "burn_after_read" ? 10 : undefined);
+
       const msgPayload: ChatMessage = {
         id: Math.random().toString(36).slice(2, 11),
         senderId: socket.id,
@@ -219,14 +225,33 @@ app.prepare().then(() => {
         attachment: attachment || null, // in-memory base64 preview or data
         timestamp: Date.now(),
         reactions: {},
-        burnSeconds: burnSeconds || (type === "burn_after_read" ? 10 : undefined),
+        burnSeconds: finalBurn,
+        viewedBy: [socket.id], // Sender has viewed it
       };
 
       // Broadcast to all participants in the room
       io.to(roomId).emit("new_message", msgPayload);
     });
 
-    // 5. Message Reactions (In-memory)
+    // 5. Image/Message "Viewed" event -> triggers 10s countdown for everyone
+    socket.on("message_viewed", ({ roomId, messageId }) => {
+      const room = rooms.get(roomId);
+      if (!room || !room.participants.has(socket.id)) return;
+
+      // Broadcast to all clients that this message/image has been viewed and should burn in 10s
+      io.to(roomId).emit("start_burn_timer", {
+        messageId,
+        burnSeconds: 10,
+        viewedBy: socket.id,
+      });
+
+      // Server will also enforce deletion after 11 seconds to guarantee memory purging
+      setTimeout(() => {
+        io.to(roomId).emit("message_deleted", { messageId });
+      }, 11000);
+    });
+
+    // 6. Message Reactions (In-memory)
     socket.on("react_message", ({ roomId, messageId, emoji }) => {
       const room = rooms.get(roomId);
       if (!room || !room.participants.has(socket.id)) return;
@@ -240,7 +265,7 @@ app.prepare().then(() => {
       });
     });
 
-    // 6. Delete specific message for everyone
+    // 7. Delete specific message for everyone
     socket.on("delete_message", ({ roomId, messageId }) => {
       const room = rooms.get(roomId);
       if (!room || !room.participants.has(socket.id)) return;
@@ -248,7 +273,7 @@ app.prepare().then(() => {
       io.to(roomId).emit("message_deleted", { messageId });
     });
 
-    // 7. Typing indicator
+    // 8. Typing indicator
     socket.on("typing", ({ roomId, isTyping }) => {
       const room = rooms.get(roomId);
       if (!room || !room.participants.has(socket.id)) return;
@@ -261,7 +286,7 @@ app.prepare().then(() => {
       });
     });
 
-    // 8. CLEAR all chat messages in the room
+    // 9. CLEAR all chat messages in the room
     socket.on("clear_chat", ({ roomId }) => {
       const room = rooms.get(roomId);
       if (!room || !room.participants.has(socket.id)) return;
@@ -273,7 +298,7 @@ app.prepare().then(() => {
       });
     });
 
-    // 9. CLOSE session permanently & destroy everything
+    // 10. CLOSE session permanently & destroy everything
     socket.on("close_session", ({ roomId }) => {
       const room = rooms.get(roomId);
       if (!room) return;
@@ -281,7 +306,7 @@ app.prepare().then(() => {
       destroyRoom(roomId, "Session was closed and wiped permanently by participant.");
     });
 
-    // 10. Handle Disconnect
+    // 11. Handle Disconnect
     socket.on("disconnect", () => {
       const roomId = socketToRoom.get(socket.id);
       socketToRoom.delete(socket.id);

@@ -21,11 +21,10 @@ import {
   Radio,
   Flame,
   QrCode as QrIcon,
-  Smile,
   ShieldCheck,
   Clock,
-  Download,
-  Info,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 
 interface Participant {
@@ -56,6 +55,8 @@ interface ChatMessage {
   timestamp: number;
   reactions?: Record<string, Reaction>;
   burnSeconds?: number;
+  viewed?: boolean;
+  burnRemaining?: number;
 }
 
 export default function RoomPage() {
@@ -88,6 +89,7 @@ function RoomContent() {
   // Room state
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [revealedImages, setRevealedImages] = useState<Record<string, boolean>>({});
   const [incomingKnocks, setIncomingKnocks] = useState<KnockEvent[]>([]);
   const [inputMessage, setInputMessage] = useState("");
   const [copiedLink, setCopiedLink] = useState(false);
@@ -100,7 +102,6 @@ function RoomContent() {
   const [burnMode, setBurnMode] = useState<boolean>(false);
   const [showQrModal, setShowQrModal] = useState<boolean>(false);
   const [qrDataUrl, setQrDataUrl] = useState<string>("");
-  const [showEmojiPickerFor, setShowEmojiPickerFor] = useState<string | null>(null);
 
   // Destroyed state
   const [isDestroyed, setIsDestroyed] = useState(false);
@@ -110,15 +111,15 @@ function RoomContent() {
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Play a soft audio alert (synthesized in-browser, no external audio file needed)
+  // Soft audio alert
   const playKnockTone = () => {
     try {
       const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
-      osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5 note
-      osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.15); // A5 note
+      osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(880, ctx.currentTime + 0.15);
       gain.gain.setValueAtTime(0.15, ctx.currentTime);
       gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.25);
       osc.connect(gain);
@@ -130,7 +131,7 @@ function RoomContent() {
     }
   };
 
-  // Countdown timer calculation
+  // Countdown timer for room expiration
   useEffect(() => {
     if (!expiresAt) return;
     const interval = setInterval(() => {
@@ -224,12 +225,14 @@ function RoomContent() {
     s.on("new_message", (msg: ChatMessage) => {
       setMessages((prev) => [...prev, msg]);
 
-      // If message is burn_after_read, set local auto-delete timer
+      // If text burn_after_read, auto start timer
       if (msg.type === "burn_after_read" && msg.burnSeconds) {
-        setTimeout(() => {
-          setMessages((cur) => cur.filter((m) => m.id !== msg.id));
-        }, msg.burnSeconds * 1000);
+        startLocalBurnTimer(msg.id, msg.burnSeconds);
       }
+    });
+
+    s.on("start_burn_timer", ({ messageId, burnSeconds }: { messageId: string; burnSeconds: number }) => {
+      startLocalBurnTimer(messageId, burnSeconds);
     });
 
     s.on("message_deleted", ({ messageId }) => {
@@ -279,7 +282,6 @@ function RoomContent() {
       setRejectionMessage(message);
     });
 
-    // Auto wipe on window unload
     const handleUnload = () => {
       purgeClientMemory();
     };
@@ -290,6 +292,26 @@ function RoomContent() {
       s.disconnect();
     };
   }, [roomId]);
+
+  // Local Burn Countdown Ticker
+  const startLocalBurnTimer = (messageId: string, seconds: number) => {
+    let remaining = seconds;
+    setMessages((prev) =>
+      prev.map((m) => (m.id === messageId ? { ...m, burnRemaining: remaining } : m))
+    );
+
+    const ticker = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(ticker);
+        setMessages((prev) => prev.filter((m) => m.id !== messageId));
+      } else {
+        setMessages((prev) =>
+          prev.map((m) => (m.id === messageId ? { ...m, burnRemaining: remaining } : m))
+        );
+      }
+    }, 1000);
+  };
 
   // Scroll to bottom on messages
   useEffect(() => {
@@ -361,12 +383,13 @@ function RoomContent() {
     }, 1500);
   };
 
+  // Photo / File Attachment (Pure in-memory base64)
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !socket) return;
 
     if (file.size > 8 * 1024 * 1024) {
-      alert("File exceeds 8MB limit. Ephemeral transmission only supports light media.");
+      alert("Image exceeds 8MB limit for ephemeral in-memory transfer.");
       return;
     }
 
@@ -378,16 +401,24 @@ function RoomContent() {
         content: file.name,
         type: file.type.startsWith("image/") ? "image" : "text",
         attachment: base64Data,
+        burnSeconds: 10, // All shared images auto-burn in 10s upon view!
       });
     };
     reader.readAsDataURL(file);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
+  // User taps "Reveal Image" -> Starts 10s countdown for everyone and shows image
+  const handleRevealImage = (messageId: string) => {
+    setRevealedImages((prev) => ({ ...prev, [messageId]: true }));
+    if (socket) {
+      socket.emit("message_viewed", { roomId, messageId });
+    }
+  };
+
   const handleReact = (messageId: string, emoji: string) => {
     if (!socket) return;
     socket.emit("react_message", { roomId, messageId, emoji });
-    setShowEmojiPickerFor(null);
   };
 
   const handleDeleteMessage = (messageId: string) => {
@@ -562,7 +593,7 @@ function RoomContent() {
 
           <div className="hidden sm:flex items-center gap-1.5 text-xs text-neutral-400 border-l border-neutral-800 pl-3">
             <Users className="w-3.5 h-3.5 text-neutral-400" />
-            <span>{participants.length} connected</span>
+            <span>{participants.length} online</span>
           </div>
         </div>
 
@@ -665,26 +696,29 @@ function RoomContent() {
       {/* Chat Messages Body */}
       <main className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-4 touch-pan-y overscroll-contain select-text">
         {/* Security Notice */}
-        <div className="max-w-md mx-auto text-center py-3.5 px-4 rounded-2xl bg-neutral-900/40 border border-neutral-800/60 space-y-1">
+        <div className="max-w-md mx-auto text-center py-3 px-4 rounded-2xl bg-neutral-900/40 border border-neutral-800/60 space-y-1">
           <div className="flex items-center justify-center gap-1.5 text-xs font-semibold text-emerald-400">
             <Lock className="w-3.5 h-3.5" />
             <span>End-to-End Ephemeral Session</span>
           </div>
           <p className="text-[11px] text-neutral-400">
-            Messages exist only in this browser tab's RAM. They are never written to disk, server logs, or database.
+            Shared images require tap to reveal and auto-delete in 10 seconds. Nothing is saved to disk.
           </p>
         </div>
 
         {messages.length === 0 && (
           <div className="text-center text-neutral-600 text-xs py-16 flex flex-col items-center gap-2">
             <ShieldCheck className="w-8 h-8 text-neutral-700" />
-            <span>Room is ready and private. Send a whisper to start chatting.</span>
+            <span>Room is ready and private. Send a whisper or image to start.</span>
           </div>
         )}
 
         {messages.map((msg) => {
           const isMe = msg.senderId === socket?.id;
-          const isBurn = msg.type === "burn_after_read";
+          const isImage = msg.type === "image";
+          const isBurn = msg.type === "burn_after_read" || isImage;
+          const isRevealed = revealedImages[msg.id];
+
           return (
             <div
               key={msg.id}
@@ -694,10 +728,10 @@ function RoomContent() {
                 <span className="text-[11px] font-medium text-neutral-400">
                   {isMe ? "You" : msg.senderName}
                 </span>
-                {isBurn && (
-                  <span className="inline-flex items-center gap-1 text-[10px] text-rose-400 font-mono bg-rose-500/10 px-1.5 py-0.5 rounded-full border border-rose-500/20">
-                    <Flame className="w-3 h-3 text-rose-400 animate-pulse" />
-                    Burns in 10s
+                {msg.burnRemaining !== undefined && (
+                  <span className="inline-flex items-center gap-1 text-[10px] text-rose-400 font-mono bg-rose-500/10 px-2 py-0.5 rounded-full border border-rose-500/30 animate-pulse">
+                    <Flame className="w-3 h-3 text-rose-400" />
+                    Burns in {msg.burnRemaining}s
                   </span>
                 )}
                 <span className="text-[10px] text-neutral-600 font-mono">
@@ -707,22 +741,47 @@ function RoomContent() {
 
               <div
                 className={`max-w-[85%] sm:max-w-md px-4 py-2.5 rounded-2xl text-sm leading-relaxed relative ${
-                  isBurn
-                    ? "bg-gradient-to-r from-rose-950/80 to-neutral-900 border border-rose-700/50 text-rose-100"
+                  isBurn && !isMe
+                    ? "bg-gradient-to-r from-rose-950/70 to-neutral-900 border border-rose-800/50 text-rose-100"
                     : isMe
                     ? "bg-indigo-600 text-white rounded-br-none shadow-md shadow-indigo-600/10"
                     : "bg-neutral-900 text-neutral-200 rounded-bl-none border border-neutral-800"
                 }`}
               >
-                {msg.type === "image" && msg.attachment && (
-                  <div className="mb-2 rounded-xl overflow-hidden border border-neutral-700/50">
-                    <img
-                      src={msg.attachment}
-                      alt="Attachment"
-                      className="max-h-72 w-auto object-cover rounded-xl"
-                    />
+                {/* 10-Second Tap-To-Reveal Image Privacy Handler */}
+                {isImage && msg.attachment && (
+                  <div className="mb-2">
+                    {!isRevealed ? (
+                      <button
+                        onClick={() => handleRevealImage(msg.id)}
+                        className="w-64 h-48 rounded-xl bg-neutral-950/90 border border-dashed border-neutral-700 hover:border-rose-500/60 flex flex-col items-center justify-center gap-2.5 p-4 text-center transition group/btn cursor-pointer"
+                      >
+                        <div className="w-10 h-10 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center group-hover/btn:scale-110 transition">
+                          <Eye className="w-5 h-5" />
+                        </div>
+                        <div>
+                          <p className="text-xs font-semibold text-neutral-200">Private Photo</p>
+                          <p className="text-[10px] text-rose-400 mt-0.5">
+                            Tap to reveal (Burns in 10s once opened)
+                          </p>
+                        </div>
+                      </button>
+                    ) : (
+                      <div className="rounded-xl overflow-hidden border border-rose-500/40 relative shadow-2xl">
+                        <img
+                          src={msg.attachment}
+                          alt="Attachment"
+                          className="max-h-72 w-auto object-cover rounded-xl"
+                        />
+                        <div className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-black/80 backdrop-blur-md text-[10px] font-mono text-rose-300 border border-rose-500/30 flex items-center gap-1">
+                          <Flame className="w-3 h-3 text-rose-400" />
+                          <span>{msg.burnRemaining !== undefined ? `${msg.burnRemaining}s` : "10s"}</span>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
+
                 <p className="whitespace-pre-wrap break-words">{msg.content}</p>
 
                 {/* Reactions Display */}
@@ -742,9 +801,8 @@ function RoomContent() {
                 )}
               </div>
 
-              {/* Message Quick Action Bar (Hover on desktop, permanent small trigger) */}
+              {/* Message Quick Action Bar */}
               <div className="opacity-0 group-hover:opacity-100 transition flex items-center gap-1 mt-1 px-1">
-                {/* Emoji reactions */}
                 {["👍", "❤️", "🔥", "🤫"].map((emoji) => (
                   <button
                     key={emoji}
@@ -792,7 +850,6 @@ function RoomContent() {
             ref={fileInputRef}
             onChange={handleFileUpload}
             accept="image/*"
-            capture="environment"
             className="hidden"
           />
           <button
