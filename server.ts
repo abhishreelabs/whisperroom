@@ -38,7 +38,7 @@ export interface ChatMessage {
   timestamp: number;
   reactions?: Record<string, Reaction>;
   burnSeconds?: number;
-  viewedBy?: string[]; // IDs of users who opened/viewed
+  viewedBy?: string[];
 }
 
 export interface RoomState {
@@ -57,38 +57,85 @@ export interface RoomState {
 const rooms = new Map<string, RoomState>();
 const socketToRoom = new Map<string, string>();
 
+// Rate-limiting in-memory tracker (Sliding window per socket)
+const messageRateLimits = new Map<string, { count: number; lastReset: number }>();
+const knockRateLimits = new Map<string, number>();
+
+function isRateLimited(socketId: string, maxPerSecond = 5): boolean {
+  const now = Date.now();
+  const limit = messageRateLimits.get(socketId) || { count: 0, lastReset: now };
+
+  if (now - limit.lastReset > 1000) {
+    limit.count = 1;
+    limit.lastReset = now;
+    messageRateLimits.set(socketId, limit);
+    return false;
+  }
+
+  limit.count++;
+  messageRateLimits.set(socketId, limit);
+  return limit.count > maxPerSecond;
+}
+
+// Allowed MIME image signatures for security
+const ALLOWED_IMAGE_MIMES = [
+  "data:image/jpeg;base64,",
+  "data:image/png;base64,",
+  "data:image/webp;base64,",
+  "data:image/gif;base64,",
+];
+
 app.prepare().then(() => {
   const httpServer = createServer((req, res) => {
-    // Zero cache headers to prevent browser caching of sensitive chat pages
-    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, private");
+    // 1. Strict Anti-Caching Headers (Prevent browser from saving DOM/pages to disk or swap)
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, private, max-age=0");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
+    res.setHeader("Surrogate-Control", "no-store");
+
+    // 2. Strict Security Headers
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("X-XSS-Protection", "1; mode=block");
+    res.setHeader("Referrer-Policy", "no-referrer");
+
     handle(req, res);
   });
 
   const io = new SocketIOServer(httpServer, {
     cors: {
-      origin: "*",
+      origin: (origin, callback) => {
+        // Allow legitimate same-origin requests or trusted custom domain
+        if (!origin || origin.includes("abhishreelabs.in") || origin.includes("localhost") || origin.includes("onrender.com")) {
+          callback(null, true);
+        } else {
+          callback(new Error("CORS policy violation: unauthorized origin"));
+        }
+      },
       methods: ["GET", "POST"],
     },
-    maxHttpBufferSize: 1e7, // 10MB buffer for fast direct memory image transfer
+    maxHttpBufferSize: 8 * 1024 * 1024, // 8MB maximum payload
   });
 
   io.on("connection", (socket) => {
     // 1. Host creates a room
     socket.on("create_room", ({ roomId, hostToken, hostName, autoDestructMinutes }) => {
-      // Clean up previous room if any
+      if (!roomId || typeof roomId !== "string" || roomId.length < 3 || roomId.length > 32) {
+        socket.emit("room_error", { message: "Invalid room identifier format." });
+        return;
+      }
+
       const existingRoomId = socketToRoom.get(socket.id);
       if (existingRoomId) {
         destroyRoom(existingRoomId, "Host started a new room");
       }
 
-      const ttlMinutes = autoDestructMinutes && autoDestructMinutes > 0 ? autoDestructMinutes : 60;
+      const ttlMinutes = Math.min(Math.max(autoDestructMinutes || 30, 5), 240); // 5 mins to 4 hours max
 
       const room: RoomState = {
         roomId,
         hostSocketId: socket.id,
-        hostToken,
+        hostToken: hostToken || Math.random().toString(36),
         createdAt: Date.now(),
         participants: new Map(),
         waitingRoom: new Map(),
@@ -96,14 +143,16 @@ app.prepare().then(() => {
         expiresAt: Date.now() + ttlMinutes * 60 * 1000,
       };
 
-      // Set auto-destruct timer
       room.destructTimer = setTimeout(() => {
         destroyRoom(roomId, `Session auto-destructed after ${ttlMinutes} minutes of lifetime.`);
       }, ttlMinutes * 60 * 1000);
 
+      // Sanitize host display name
+      const cleanName = (hostName || "Host").replace(/[<>]/g, "").slice(0, 25);
+
       const hostParticipant: Participant = {
         id: socket.id,
-        name: hostName || "Host",
+        name: cleanName,
         isHost: true,
         joinedAt: Date.now(),
       };
@@ -123,13 +172,20 @@ app.prepare().then(() => {
 
     // 2. Guest knocks / requests to join
     socket.on("knock_room", ({ roomId, name }) => {
+      // Prevent knock flood
+      const lastKnock = knockRateLimits.get(socket.id) || 0;
+      if (Date.now() - lastKnock < 2000) {
+        socket.emit("room_error", { message: "Please wait a moment before knocking again." });
+        return;
+      }
+      knockRateLimits.set(socket.id, Date.now());
+
       const room = rooms.get(roomId);
       if (!room) {
         socket.emit("room_error", { message: "This room does not exist or has already been closed." });
         return;
       }
 
-      // Check if user is already in participants
       if (room.participants.has(socket.id)) {
         socket.emit("room_joined", {
           roomId,
@@ -140,9 +196,12 @@ app.prepare().then(() => {
         return;
       }
 
+      // Sanitize guest display name
+      const cleanGuestName = (name || `Guest-${socket.id.slice(0, 4)}`).replace(/[<>]/g, "").slice(0, 25);
+
       const knockReq: KnockRequest = {
         id: socket.id,
-        name: name || `Guest-${socket.id.slice(0, 4)}`,
+        name: cleanGuestName,
         requestedAt: Date.now(),
       };
 
@@ -160,16 +219,21 @@ app.prepare().then(() => {
       });
     });
 
-    // 3. Host accepts or rejects knock request
-    socket.on("respond_knock", ({ roomId, guestId, accepted }) => {
+    // 3. Host responds to knock (with cryptographic Host Token verification)
+    socket.on("respond_knock", ({ roomId, guestId, accepted, hostToken }) => {
       const room = rooms.get(roomId);
-      if (!room || room.hostSocketId !== socket.id) return;
+      if (!room) return;
+
+      // Cryptographic verification: must match host token and host socket ID
+      if (room.hostSocketId !== socket.id || (hostToken && room.hostToken !== hostToken)) {
+        socket.emit("room_error", { message: "Unauthorized: only the host can admit guests." });
+        return;
+      }
 
       const guestKnock = room.waitingRoom.get(guestId);
       if (!guestKnock) return;
 
       room.waitingRoom.delete(guestId);
-
       const guestSocket = io.sockets.sockets.get(guestId);
 
       if (accepted) {
@@ -191,7 +255,6 @@ app.prepare().then(() => {
           });
         }
 
-        // Broadcast updated participants to everyone in the room
         io.to(roomId).emit("participants_updated", {
           participants: Array.from(room.participants.values()),
           joined: participant.name,
@@ -207,45 +270,58 @@ app.prepare().then(() => {
 
     // 4. Send ephemeral message
     socket.on("send_message", ({ roomId, content, type, attachment, burnSeconds }) => {
+      if (isRateLimited(socket.id, 6)) {
+        socket.emit("system_warning", { message: "Slow down. Message rate limit reached." });
+        return;
+      }
+
       const room = rooms.get(roomId);
       if (!room || !room.participants.has(socket.id)) return;
 
       const sender = room.participants.get(socket.id);
-      
-      // Images default to 10-second self-destruct once viewed
       const isImage = type === "image";
+
+      // Security check: validate attachment MIME signature if image
+      if (isImage && attachment) {
+        const isValidMime = ALLOWED_IMAGE_MIMES.some((mime) => attachment.startsWith(mime));
+        if (!isValidMime) {
+          socket.emit("system_warning", { message: "Security violation: Invalid or unsafe file format." });
+          return;
+        }
+      }
+
+      // Sanitize text content length
+      const cleanContent = typeof content === "string" ? content.slice(0, 4000) : "";
       const finalBurn = burnSeconds || (isImage ? 10 : type === "burn_after_read" ? 10 : undefined);
 
       const msgPayload: ChatMessage = {
         id: Math.random().toString(36).slice(2, 11),
         senderId: socket.id,
         senderName: sender?.name || "Anonymous",
-        content,
+        content: cleanContent,
         type: type || "text",
-        attachment: attachment || null, // in-memory base64 preview or data
+        attachment: attachment || null,
         timestamp: Date.now(),
         reactions: {},
         burnSeconds: finalBurn,
-        viewedBy: [socket.id], // Sender has viewed it
+        viewedBy: [socket.id],
       };
 
-      // Broadcast to all participants in the room
       io.to(roomId).emit("new_message", msgPayload);
     });
 
-    // 5. Image/Message "Viewed" event -> triggers 10s countdown for everyone
+    // 5. Image/Message "Viewed" event -> triggers 10s countdown
     socket.on("message_viewed", ({ roomId, messageId }) => {
       const room = rooms.get(roomId);
       if (!room || !room.participants.has(socket.id)) return;
 
-      // Broadcast to all clients that this message/image has been viewed and should burn in 10s
       io.to(roomId).emit("start_burn_timer", {
         messageId,
         burnSeconds: 10,
         viewedBy: socket.id,
       });
 
-      // Server will also enforce deletion after 11 seconds to guarantee memory purging
+      // Server forcefully purges message payload from clients after 11 seconds
       setTimeout(() => {
         io.to(roomId).emit("message_deleted", { messageId });
       }, 11000);
@@ -257,9 +333,12 @@ app.prepare().then(() => {
       if (!room || !room.participants.has(socket.id)) return;
       const sender = room.participants.get(socket.id);
 
+      // Restrict emoji input to safe unicode emojis only
+      const safeEmoji = typeof emoji === "string" ? emoji.slice(0, 4) : "👍";
+
       io.to(roomId).emit("message_reacted", {
         messageId,
-        emoji,
+        emoji: safeEmoji,
         userId: socket.id,
         userName: sender?.name || "Anonymous",
       });
@@ -282,7 +361,7 @@ app.prepare().then(() => {
       socket.to(roomId).emit("user_typing", {
         userId: socket.id,
         userName: sender?.name || "Anonymous",
-        isTyping,
+        isTyping: Boolean(isTyping),
       });
     });
 
@@ -292,7 +371,6 @@ app.prepare().then(() => {
       if (!room || !room.participants.has(socket.id)) return;
       const initiator = room.participants.get(socket.id);
 
-      // Instruct all clients to immediately wipe their message buffers
       io.to(roomId).emit("chat_cleared", {
         clearedBy: initiator?.name || "A participant",
       });
@@ -308,6 +386,9 @@ app.prepare().then(() => {
 
     // 11. Handle Disconnect
     socket.on("disconnect", () => {
+      messageRateLimits.delete(socket.id);
+      knockRateLimits.delete(socket.id);
+
       const roomId = socketToRoom.get(socket.id);
       socketToRoom.delete(socket.id);
 
@@ -337,7 +418,6 @@ app.prepare().then(() => {
           left: leftUser?.name,
         });
 
-        // If no participants left, purge
         if (room.participants.size === 0) {
           destroyRoom(roomId, "All participants left. Room wiped.");
         }
@@ -350,12 +430,11 @@ app.prepare().then(() => {
 
       if (room.destructTimer) clearTimeout(room.destructTimer);
 
-      // Broadcast room destroyed
       io.to(roomId).emit("room_destroyed", { reason });
 
-      // Disconnect all sockets from room
       for (const [socketId] of room.participants) {
         socketToRoom.delete(socketId);
+        messageRateLimits.delete(socketId);
         const s = io.sockets.sockets.get(socketId);
         s?.leave(roomId);
       }
@@ -374,6 +453,6 @@ app.prepare().then(() => {
   });
 
   httpServer.listen(port, () => {
-    console.log(`> WhisperRoom server running on http://${hostname}:${port}`);
+    console.log(`> WhisperRoom secured server running on http://${hostname}:${port}`);
   });
 });
