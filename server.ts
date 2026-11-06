@@ -3,7 +3,7 @@ import next from "next";
 import { Server as SocketIOServer } from "socket.io";
 
 const dev = process.env.NODE_ENV !== "production";
-const hostname = process.env.HOSTNAME || "localhost";
+const hostname = process.env.HOSTNAME || "0.0.0.0";
 const port = parseInt(process.env.PORT || "3000", 10);
 
 const app = next({ dev, hostname, port });
@@ -22,6 +22,24 @@ export interface KnockRequest {
   requestedAt: number;
 }
 
+export interface Reaction {
+  emoji: string;
+  count: number;
+  users: string[]; // names
+}
+
+export interface ChatMessage {
+  id: string;
+  senderId: string;
+  senderName: string;
+  content: string;
+  type?: "text" | "image" | "burn_after_read";
+  attachment?: string | null;
+  timestamp: number;
+  reactions?: Record<string, Reaction>;
+  burnSeconds?: number;
+}
+
 export interface RoomState {
   roomId: string;
   hostSocketId: string;
@@ -29,6 +47,9 @@ export interface RoomState {
   createdAt: number;
   participants: Map<string, Participant>;
   waitingRoom: Map<string, KnockRequest>;
+  autoDestructMinutes: number;
+  expiresAt: number;
+  destructTimer?: NodeJS.Timeout;
 }
 
 // In-Memory state ONLY (no disk writes, no database)
@@ -49,16 +70,19 @@ app.prepare().then(() => {
       origin: "*",
       methods: ["GET", "POST"],
     },
+    maxHttpBufferSize: 1e7, // 10MB buffer for fast image/file transfer
   });
 
   io.on("connection", (socket) => {
     // 1. Host creates a room
-    socket.on("create_room", ({ roomId, hostToken, hostName }) => {
+    socket.on("create_room", ({ roomId, hostToken, hostName, autoDestructMinutes }) => {
       // Clean up previous room if any
       const existingRoomId = socketToRoom.get(socket.id);
       if (existingRoomId) {
         destroyRoom(existingRoomId, "Host started a new room");
       }
+
+      const ttlMinutes = autoDestructMinutes && autoDestructMinutes > 0 ? autoDestructMinutes : 60;
 
       const room: RoomState = {
         roomId,
@@ -67,7 +91,14 @@ app.prepare().then(() => {
         createdAt: Date.now(),
         participants: new Map(),
         waitingRoom: new Map(),
+        autoDestructMinutes: ttlMinutes,
+        expiresAt: Date.now() + ttlMinutes * 60 * 1000,
       };
+
+      // Set auto-destruct timer
+      room.destructTimer = setTimeout(() => {
+        destroyRoom(roomId, `Session auto-destructed after ${ttlMinutes} minutes of lifetime.`);
+      }, ttlMinutes * 60 * 1000);
 
       const hostParticipant: Participant = {
         id: socket.id,
@@ -85,6 +116,7 @@ app.prepare().then(() => {
       socket.emit("room_created", {
         roomId,
         participants: Array.from(room.participants.values()),
+        expiresAt: room.expiresAt,
       });
     });
 
@@ -102,6 +134,7 @@ app.prepare().then(() => {
           roomId,
           participants: Array.from(room.participants.values()),
           isHost: false,
+          expiresAt: room.expiresAt,
         });
         return;
       }
@@ -153,6 +186,7 @@ app.prepare().then(() => {
             roomId,
             participants: Array.from(room.participants.values()),
             self: participant,
+            expiresAt: room.expiresAt,
           });
         }
 
@@ -171,12 +205,12 @@ app.prepare().then(() => {
     });
 
     // 4. Send ephemeral message
-    socket.on("send_message", ({ roomId, content, type, attachment }) => {
+    socket.on("send_message", ({ roomId, content, type, attachment, burnSeconds }) => {
       const room = rooms.get(roomId);
       if (!room || !room.participants.has(socket.id)) return;
 
       const sender = room.participants.get(socket.id);
-      const msgPayload = {
+      const msgPayload: ChatMessage = {
         id: Math.random().toString(36).slice(2, 11),
         senderId: socket.id,
         senderName: sender?.name || "Anonymous",
@@ -184,13 +218,37 @@ app.prepare().then(() => {
         type: type || "text",
         attachment: attachment || null, // in-memory base64 preview or data
         timestamp: Date.now(),
+        reactions: {},
+        burnSeconds: burnSeconds || (type === "burn_after_read" ? 10 : undefined),
       };
 
       // Broadcast to all participants in the room
       io.to(roomId).emit("new_message", msgPayload);
     });
 
-    // 5. Typing indicator
+    // 5. Message Reactions (In-memory)
+    socket.on("react_message", ({ roomId, messageId, emoji }) => {
+      const room = rooms.get(roomId);
+      if (!room || !room.participants.has(socket.id)) return;
+      const sender = room.participants.get(socket.id);
+
+      io.to(roomId).emit("message_reacted", {
+        messageId,
+        emoji,
+        userId: socket.id,
+        userName: sender?.name || "Anonymous",
+      });
+    });
+
+    // 6. Delete specific message for everyone
+    socket.on("delete_message", ({ roomId, messageId }) => {
+      const room = rooms.get(roomId);
+      if (!room || !room.participants.has(socket.id)) return;
+
+      io.to(roomId).emit("message_deleted", { messageId });
+    });
+
+    // 7. Typing indicator
     socket.on("typing", ({ roomId, isTyping }) => {
       const room = rooms.get(roomId);
       if (!room || !room.participants.has(socket.id)) return;
@@ -203,7 +261,7 @@ app.prepare().then(() => {
       });
     });
 
-    // 6. CLEAR all chat messages in the room
+    // 8. CLEAR all chat messages in the room
     socket.on("clear_chat", ({ roomId }) => {
       const room = rooms.get(roomId);
       if (!room || !room.participants.has(socket.id)) return;
@@ -215,16 +273,15 @@ app.prepare().then(() => {
       });
     });
 
-    // 7. CLOSE session permanently & destroy everything
+    // 9. CLOSE session permanently & destroy everything
     socket.on("close_session", ({ roomId }) => {
       const room = rooms.get(roomId);
       if (!room) return;
 
-      // Either host or any authorized participant can trigger destruction if desired
-      destroyRoom(roomId, "Session was closed and wiped permanently.");
+      destroyRoom(roomId, "Session was closed and wiped permanently by participant.");
     });
 
-    // 8. Handle Disconnect
+    // 10. Handle Disconnect
     socket.on("disconnect", () => {
       const roomId = socketToRoom.get(socket.id);
       socketToRoom.delete(socket.id);
@@ -233,7 +290,7 @@ app.prepare().then(() => {
       const room = rooms.get(roomId);
       if (!room) return;
 
-      // If host disconnected, auto destroy the room after 5 seconds if not reconnected
+      // If host disconnected, auto destroy the room
       if (room.hostSocketId === socket.id) {
         destroyRoom(roomId, "Host left the session. Room permanently destroyed.");
         return;
@@ -257,7 +314,7 @@ app.prepare().then(() => {
 
         // If no participants left, purge
         if (room.participants.size === 0) {
-          rooms.delete(roomId);
+          destroyRoom(roomId, "All participants left. Room wiped.");
         }
       }
     });
@@ -265,6 +322,8 @@ app.prepare().then(() => {
     function destroyRoom(roomId: string, reason: string) {
       const room = rooms.get(roomId);
       if (!room) return;
+
+      if (room.destructTimer) clearTimeout(room.destructTimer);
 
       // Broadcast room destroyed
       io.to(roomId).emit("room_destroyed", { reason });
@@ -290,6 +349,6 @@ app.prepare().then(() => {
   });
 
   httpServer.listen(port, () => {
-    console.log(`> Ephemeral Chat server ready on http://${hostname}:${port}`);
+    console.log(`> WhisperRoom server running on http://${hostname}:${port}`);
   });
 });
