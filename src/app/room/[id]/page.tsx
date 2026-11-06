@@ -536,9 +536,9 @@ function RoomContent() {
 
   // 3. Active Chat Screen
   return (
-    <div className="flex flex-col h-screen max-h-screen bg-neutral-950 text-neutral-100 overflow-hidden font-sans">
+    <div className="flex flex-col h-screen h-screen-dvh max-h-screen bg-neutral-950 text-neutral-100 overflow-hidden font-sans select-none">
       {/* Top Bar */}
-      <header className="h-16 border-b border-neutral-800/80 bg-neutral-900/70 backdrop-blur-md px-3 sm:px-6 flex items-center justify-between shrink-0 z-20">
+      <header className="h-16 pt-safe border-b border-neutral-800/80 bg-neutral-900/80 backdrop-blur-md px-3 sm:px-6 flex items-center justify-between shrink-0 z-20">
         <div className="flex items-center gap-2 sm:gap-3">
           <div className="flex items-center gap-2">
             <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -663,7 +663,7 @@ function RoomContent() {
       )}
 
       {/* Chat Messages Body */}
-      <main className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
+      <main className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-4 touch-pan-y overscroll-contain select-text">
         {/* Security Notice */}
         <div className="max-w-md mx-auto text-center py-3.5 px-4 rounded-2xl bg-neutral-900/40 border border-neutral-800/60 space-y-1">
           <div className="flex items-center justify-center gap-1.5 text-xs font-semibold text-emerald-400">
@@ -784,21 +784,22 @@ function RoomContent() {
       </main>
 
       {/* Chat Input Bar */}
-      <footer className="p-3 sm:p-4 bg-neutral-900/80 border-t border-neutral-800/80 backdrop-blur-md shrink-0">
-        <form onSubmit={handleSendMessage} className="max-w-4xl mx-auto flex items-center gap-2">
+      <footer className="p-2.5 sm:p-4 pb-safe bg-neutral-900/90 border-t border-neutral-800/80 backdrop-blur-md shrink-0">
+        <form onSubmit={handleSendMessage} className="max-w-4xl mx-auto flex items-center gap-1.5 sm:gap-2">
           {/* File / Image Attachment Button */}
           <input
             type="file"
             ref={fileInputRef}
             onChange={handleFileUpload}
-            accept="image/*,.pdf,.txt"
+            accept="image/*"
+            capture="environment"
             className="hidden"
           />
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            className="p-2.5 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-white transition cursor-pointer shrink-0"
-            title="Attach in-memory image"
+            className="p-2.5 rounded-xl bg-neutral-800 active:bg-neutral-700 text-neutral-400 active:text-white transition cursor-pointer shrink-0 min-w-[40px] min-h-[40px] flex items-center justify-center"
+            title="Attach in-memory photo"
           >
             <Paperclip className="w-4 h-4" />
           </button>
@@ -807,12 +808,12 @@ function RoomContent() {
           <button
             type="button"
             onClick={() => setBurnMode(!burnMode)}
-            className={`p-2.5 rounded-xl transition cursor-pointer shrink-0 border ${
+            className={`p-2.5 rounded-xl transition cursor-pointer shrink-0 min-w-[40px] min-h-[40px] flex items-center justify-center border ${
               burnMode
                 ? "bg-rose-500/20 border-rose-500/60 text-rose-400 ring-2 ring-rose-500/20"
-                : "bg-neutral-800 border-transparent text-neutral-400 hover:text-white"
+                : "bg-neutral-800 border-transparent text-neutral-400 active:text-white"
             }`}
-            title={burnMode ? "Burn-after-read: Active (disappears in 10s)" : "Enable burn-after-read (disappears in 10s)"}
+            title={burnMode ? "Burn-after-read: Active (10s)" : "Enable burn-after-read"}
           >
             <Flame className="w-4 h-4" />
           </button>
@@ -821,11 +822,12 @@ function RoomContent() {
             type="text"
             value={inputMessage}
             onChange={handleTypingInput}
-            placeholder={burnMode ? "🔥 Type a self-destructing whisper (burns in 10s)..." : "Type a disappearing message..."}
-            autoFocus
+            placeholder={burnMode ? "🔥 Burns in 10s..." : "Disappearing message..."}
             autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="sentences"
             spellCheck="false"
-            className={`flex-1 bg-neutral-950 border rounded-xl px-4 py-2.5 text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none transition ${
+            className={`flex-1 bg-neutral-950 border rounded-xl px-3.5 py-2.5 text-base sm:text-sm text-neutral-100 placeholder-neutral-500 focus:outline-none transition ${
               burnMode
                 ? "border-rose-500/60 focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
                 : "border-neutral-800 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
@@ -835,10 +837,10 @@ function RoomContent() {
           <button
             type="submit"
             disabled={!inputMessage.trim()}
-            className={`p-2.5 rounded-xl text-white transition shadow-md cursor-pointer shrink-0 disabled:opacity-40 ${
+            className={`p-2.5 rounded-xl text-white transition shadow-md cursor-pointer shrink-0 min-w-[40px] min-h-[40px] flex items-center justify-center disabled:opacity-40 active:scale-95 ${
               burnMode
-                ? "bg-rose-600 hover:bg-rose-500 shadow-rose-600/20"
-                : "bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/20"
+                ? "bg-rose-600 active:bg-rose-500 shadow-rose-600/20"
+                : "bg-indigo-600 active:bg-indigo-500 shadow-indigo-600/20"
             }`}
           >
             <Send className="w-4 h-4" />
